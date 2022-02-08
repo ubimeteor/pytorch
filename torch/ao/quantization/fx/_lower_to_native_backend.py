@@ -33,9 +33,10 @@ def _lower_weighted_ref_module(model: QuantizedGraphModule) -> QuantizedGraphMod
     Traverse the graph and find dequantize - ref module - quantize patterns
     and replace them with the quantized version of the ref module.
     """
-    for ref_class in list(LOWER_MODULE_MAP.keys()) + list(LOWER_FUSED_MODULE_MAP.keys()):
+    for ref_class in [torch.nn.functional.linear]:
+    #for ref_class in list(LOWER_MODULE_MAP.keys()) + list(LOWER_FUSED_MODULE_MAP.keys()):
         pattern = (torch.quantize_per_tensor,
-                   (ref_class, "dequantize"),
+                   (ref_class, "dequantize", "dequantize"),
                    MatchAllNode, MatchAllNode, MatchAllNode)
         modules = dict(model.named_modules(remove_duplicate=False))
         nodes = list(model.graph.nodes)
@@ -44,6 +45,7 @@ def _lower_weighted_ref_module(model: QuantizedGraphModule) -> QuantizedGraphMod
         for n in model.graph.nodes:
             if not is_match(modules, n, pattern):
                 continue
+            print("HELLO!!!!!!!! MATCH!!!!!!!!!!!!!")
             q_node = n
             ref_node = q_node.args[0]
             dq_node = ref_node.args[0]
