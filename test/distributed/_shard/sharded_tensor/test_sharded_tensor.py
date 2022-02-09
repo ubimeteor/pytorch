@@ -224,9 +224,7 @@ class TestShardParameter(ShardedTensorTestBase):
                 placement="rank:1/cuda:1",
             ),
         ])
-        with self.assertRaisesRegex(
-            NotImplementedError, 'Only ChunkShardingspec is supported.'
-        ):
+        with self.assertRaisesRegex(NotImplementedError, 'not implemented yet!'):
             shard_parameter(fc, 'weight', spec)
 
 
@@ -301,7 +299,7 @@ class TestShardTensor(ShardedTensorTestBase):
             ),
         ])
         with self.assertRaisesRegex(
-            NotImplementedError, 'Only ChunkShardingspec is supported.'
+            NotImplementedError, 'not implemented yet!'
         ):
             _shard_tensor(tensor, spec)
 
@@ -885,8 +883,8 @@ class TestShardedTensorChunked(ShardedTensorTestBase):
     def test_invalid_sharding(self):
         self.init_pg()
 
-        spec = ChunkShardingSpec(dim='H', placements=["rank:1/cuda:1"])
-        with self.assertRaisesRegex(ValueError, 'needs to be an integer'):
+        with self.assertRaisesRegex(NotImplementedError, 'does not support named dimension'):
+            spec = ChunkShardingSpec(dim='H', placements=["rank:1/cuda:1"])
             sharded_tensor.empty(spec, 10, 20)
 
         for dim in [2, 3, 4, -3, -4, -5]:
