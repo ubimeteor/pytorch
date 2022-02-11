@@ -6868,7 +6868,7 @@
     CPU: index_select_cpu_
     QuantizedCPU: index_select_quantized_cpu_
     CUDA, QuantizedCUDA: index_select_cuda
-    SparseCPU: index_select_sparse
+    SparseCPU: index_select_sparse_cpu
     SparseCUDA: index_select_sparse
 
 - func: index_select.dimname_out(Tensor self, Dimname dim, Tensor index, *, Tensor(a!) out) -> Tensor(a!)

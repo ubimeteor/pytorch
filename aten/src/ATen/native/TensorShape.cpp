@@ -1390,6 +1390,183 @@ Tensor index_select_sparse(const Tensor& self, int64_t dim, const Tensor& index)
   }
 }
 
+Tensor index_select_sparse_cpu(const Tensor& self, int64_t dim, const Tensor& index) {
+  /*
+    Algorithm:
+    index - a 1-D tensor of indicies with shape (n,)
+    self - sparse tensor, its shape is sizes = sparse_shape + dense_shape
+      indices - 2-D tensor of indices, shape is (sparse_dims, nnz)
+      values - (1+len(dense_shape))-D tensor of values, shape is (nnz,) + dense_shape
+    index_select(dim, index) returns a sparse tensor with the following data
+      new_sizes = sizes[:dim] + (n,) + sizes[dim+1:]
+      new_indices - shape is (sparse_dims, new_nnz)
+      new_values - shape is (new_nnz,) + dense_shape
+
+      if dim < len(sparse_shape):
+          for i, idx in enumerate(index):
+              for j, jdx in enumerate(indices[dim]):
+                  if idx == jdx:
+                      icol = indices[:dim][j] + (i,) + indices[dim+1:][j]
+                      new_indices.add_column(icol)
+                      new_values.add_row(values[j])
+      else:
+          new_indices = indices
+          new_values[k] = values[k].index_select(dim - len(sparse_shape), index) for k in range(nnz)
+    */
+  auto ndim = self.dim();
+  if (ndim == 0) {
+    TORCH_CHECK_INDEX(false, "index_select() cannot be applied to a 0-dim tensor.");
+  }
+  if (!(index.dim() == 1 && index.dtype() == at::kLong)) {
+    TORCH_CHECK_INDEX(false, "index_select() argument index must be 1-D long-tensor.");
+  }
+  dim = maybe_wrap_dim(dim, ndim);
+  auto size = self.size(dim);
+  auto sparse_dim = self.sparse_dim();
+  auto dense_dim = self.dense_dim();
+  auto indices = self._indices();
+  auto values = self._values();
+  auto nnz = values.size(0);
+  auto res_sizes = self.sizes().vec();
+  res_sizes[dim] = index.size(0);
+
+  if (dim < sparse_dim) {
+    const auto dim_indices = indices[dim].contiguous();
+    const auto* ptr_dim_indices = dim_indices.data_ptr<int64_t>();
+
+    using Index = int64_t;
+    using Indices = std::vector<Index>;
+    using HashTable = std::unordered_map<Index, Indices>;
+    using HashTables = std::vector<HashTable>;
+
+    const auto grain_size = at::internal::GRAIN_SIZE;
+    // 1 <= n_threads_nnz <= min(ceil(nnz / grain_size), get_num_threads())
+    const auto n_threads_nnz = std::max<int64_t>(
+        1,
+        std::min<int64_t>((nnz + grain_size - 1) / grain_size, at::get_num_threads())
+    );
+
+    // Fill in hash tables
+    auto hash_tables = HashTables(n_threads_nnz);
+    at::parallel_for(0, nnz, grain_size, [&](int64_t start, int64_t end) {
+        const auto tid = at::get_thread_num();
+        auto& hash_table = hash_tables[tid];
+        for (const auto i : c10::irange(start, end)) {
+          const auto dim_idx = ptr_dim_indices[i];
+          auto search_dim_idx = hash_table.find(dim_idx);
+          // If not found, init
+          if (search_dim_idx == hash_table.end()) {
+            hash_table[dim_idx] = {i};
+          }
+          // Otherwise append index i to the list
+          else {
+            search_dim_idx->second.push_back(i);
+          }
+        }
+    });
+
+    const auto index_len = res_sizes[dim];
+    // 1 <= n_threads_nnz <= min(ceil(len(index) / grain_size), get_num_threads())
+    const auto n_threads_index_len = std::max<int64_t>(
+        1,
+        std::min<int64_t>((index_len + grain_size - 1) / grain_size, at::get_num_threads())
+    );
+
+    const auto* ptr_index = index.data_ptr<int64_t>();
+    auto nnz_per_threads = std::vector<int64_t>(n_threads_index_len);
+    at::parallel_for(0, index_len, grain_size, [&](int64_t start, int64_t end) {
+        const auto tid = at::get_thread_num();
+        for (auto i = start; i < end; ++i) {
+          auto idx = ptr_index[i];
+          if (idx < -size || idx >= size) {
+            TORCH_CHECK_INDEX(false,
+                "index_select(): index contains ", idx, " that is out of range for tensor of size ",
+                self.sizes(), " at dimension ", dim
+            );
+          }
+          if (idx < 0) {
+            idx += size;
+          }
+
+          // look up idx in hash tables
+          for (const auto& hash_table : hash_tables) {
+            const auto search_idx = hash_table.find(idx);
+            if (search_idx != hash_table.end()) {
+              nnz_per_threads[tid] += search_idx->second.size();
+            }
+          }
+        }
+    });
+
+    // aggregate nnz per thread to form nnz of the result
+    int64_t res_nnz = 0;
+    for (const auto& nnz_per_thread : nnz_per_threads) {
+      res_nnz += nnz_per_thread;
+    }
+
+    auto selected_indices = at::empty({res_nnz}, index.options());
+    auto selected_indices_ptr_heads = std::vector<int64_t*>(n_threads_index_len);
+    selected_indices_ptr_heads[0] = selected_indices.data_ptr<int64_t>();
+
+    auto res_dim_indices = at::empty({res_nnz}, index.options());
+    auto res_dim_indices_ptr_heads = std::vector<int64_t*>(n_threads_index_len);
+    res_dim_indices_ptr_heads[0] = res_dim_indices.data_ptr<int64_t>();
+
+    for (const auto i : c10::irange(n_threads_index_len - 1)) {
+      const auto nnz_per_i_thread = nnz_per_threads[i];
+      selected_indices_ptr_heads[i + 1] = selected_indices_ptr_heads[i] + nnz_per_i_thread;
+      res_dim_indices_ptr_heads[i + 1] = res_dim_indices_ptr_heads[i] + nnz_per_i_thread;
+    }
+
+    at::parallel_for(0, index_len, grain_size, [&](int64_t start, int64_t end) {
+        const auto tid = at::get_thread_num();
+        for (auto i = start; i < end; ++i) {
+          auto idx = ptr_index[i];
+          if (idx < 0) {
+            idx += size;
+          }
+
+          // look up idx in hash tables
+          for (const auto& hash_table : hash_tables) {
+            const auto search_idx = hash_table.find(idx);
+            if (search_idx != hash_table.end()) {
+              const auto idx_indices = search_idx->second;
+              std::copy(
+                  idx_indices.begin(),
+                  idx_indices.end(),
+                  selected_indices_ptr_heads[tid]
+              );
+              std::fill(
+                  res_dim_indices_ptr_heads[tid],
+                  res_dim_indices_ptr_heads[tid] + idx_indices.size(),
+                  i
+              );
+              selected_indices_ptr_heads[tid] += idx_indices.size();
+              res_dim_indices_ptr_heads[tid] += idx_indices.size();
+            }
+          }
+        }
+    });
+
+    auto res_indices = indices.index_select(1, selected_indices);
+    res_indices[dim] = res_dim_indices;
+    auto res_values = values.index_select(0, selected_indices);
+
+    return _sparse_coo_tensor_with_dims_and_tensors(
+        sparse_dim, dense_dim, res_sizes, res_indices, res_values, self.options());
+  }
+  else {
+    auto vsize = values.sizes().vec();
+    vsize[dim + 1 - sparse_dim] = index.size(0);
+    auto new_values = at::empty(vsize, values.options());
+    for (const auto k : c10::irange(nnz)) {
+      new_values[k] = values[k].index_select(dim - sparse_dim, index);
+    }
+    return _sparse_coo_tensor_with_dims_and_tensors(
+        sparse_dim, dense_dim, res_sizes, indices, new_values, self.options());
+  }
+}
+
 Tensor slice(
     const Tensor& self,
     int64_t dim,
